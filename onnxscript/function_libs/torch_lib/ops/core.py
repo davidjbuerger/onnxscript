@@ -3562,14 +3562,6 @@ def _aten_embedding_bag_1d_padding_idx_onnx(
     if padding_idx < 0:
         padding_idx = padding_idx + num_embeddings_scalar
 
-    # Get weight out according to indices,
-    # e.g. indices=[3,1,4,5,3] means get weight[[3,1,4,5,3]]
-    indices_weight = op.Gather(weight, indices)
-    # This happens after first step of Gather. Because Shape(indices)==Shape(per_sample_weights)
-    indices_weight = op.Mul(indices_weight, op.Unsqueeze(per_sample_weights, axes=[1]))
-
-    # The element in sequence must be FLOAT32 dtype due to ORT bug
-    indices_weight = op.Cast(indices_weight, to=FLOAT.dtype)
     # FIXME: https://github.com/microsoft/onnxruntime/issues/16846
     result = op.SequenceEmpty()
 
@@ -3585,29 +3577,52 @@ def _aten_embedding_bag_1d_padding_idx_onnx(
         # Change [0,2,3] -> [0,2,3,end], means [0:2],[2:3],[3:end]
         offsets = op.Concat(offsets, idx_size, axis=0)
 
+    # Drop the padding entries up front, so that only the real entries are gathered
+    # from the weight. Padded inputs have many slots and few real entries.
+    normalized_indices = op.Where(
+        indices < 0, indices + num_embeddings_scalar, indices
+    )
+    keep = op.Not(op.Equal(normalized_indices, padding_idx))
+    kept_positions = op.Compress(op.Range(0, op.Size(indices), 1), keep, axis=0)
+    kept_indices = op.Gather(indices, kept_positions)
+    kept_per_sample_weights = op.Gather(per_sample_weights, kept_positions)
+    keep_as_int = op.Cast(keep, to=INT64.dtype)
+
+    # Get weight out according to the real indices,
+    # e.g. indices=[3,1,4,5,3] means get weight[[3,1,4,5,3]]
+    indices_weight = op.Gather(weight, kept_indices)
+    # Shape(kept_indices)==Shape(kept_per_sample_weights)
+    indices_weight = op.Mul(indices_weight, op.Unsqueeze(kept_per_sample_weights, axes=[1]))
+    # The element in sequence must be FLOAT32 dtype due to ORT bug
+    indices_weight = op.Cast(indices_weight, to=FLOAT.dtype)
+
     # Process each bag
     i = op.Constant(value_int=0)  # Used for iterator
+    # Number of real entries in the previous bags: where this bag starts among the
+    # real entries. (A running count, because CumSum is slow on some backends.)
+    end_pos = op.Constant(value_int=0)
     cond_1 = i < num_bag
     while cond_1:
-        start_pos = op.Gather(offsets, i)
-        end_pos = op.Gather(offsets, i + 1)
-        # Positions of this bag's entries that are not the padding index, computed
-        # with a mask instead of a per-index loop.
-        bag_positions = op.Range(start_pos, end_pos, 1)
-        bag_indices = op.Gather(indices, bag_positions)
-        normalized_indices = op.Where(
-            bag_indices < 0, bag_indices + num_embeddings_scalar, bag_indices
+        start_pos = end_pos
+        bag_start = op.Gather(offsets, i)
+        bag_end = op.Gather(offsets, i + 1)
+        bag_keep = op.Slice(
+            keep_as_int, op.Reshape(bag_start, neg_1), op.Reshape(bag_end, neg_1), [0]
         )
-        keep = op.Not(op.Equal(normalized_indices, padding_idx))
-        curr_offsets = op.Compress(bag_positions, keep, axis=0)
+        end_pos = start_pos + op.ReduceSum(bag_keep, keepdims=0)
 
         # Empty input get zero value output, not empty output
-        if op.Size(curr_offsets) == 0:
+        if end_pos == start_pos:
             dim_1 = op.Shape(weight, start=1, end=2)
             expand_shape = op.Concat([1], dim_1, axis=0)
             row_result = op.Expand([0.0], expand_shape)
         else:
-            row_weight = op.Gather(indices_weight, curr_offsets)
+            row_weight = op.Slice(
+                indices_weight,
+                op.Reshape(start_pos, neg_1),
+                op.Reshape(end_pos, neg_1),
+                [0],
+            )
             if mode == 0:  # sum
                 row_result = op.ReduceSum(row_weight, axes=[0])
             elif mode == 1:  # mean
