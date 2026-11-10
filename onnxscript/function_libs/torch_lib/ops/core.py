@@ -3591,20 +3591,15 @@ def _aten_embedding_bag_1d_padding_idx_onnx(
     while cond_1:
         start_pos = op.Gather(offsets, i)
         end_pos = op.Gather(offsets, i + 1)
-        # empty tensor
-        curr_offsets = op.Shape(indices, start=0, end=0)
-        j = start_pos
-        cond_2 = j < end_pos
-        while cond_2:
-            index = op.Gather(indices, j)
-            normalized_index = index
-            if index < 0:
-                normalized_index = index + num_embeddings_scalar
-            if not op.Equal(normalized_index, padding_idx):
-                # Something like the 'append' operation
-                curr_offsets = op.Concat(curr_offsets, op.Reshape(j, neg_1), axis=0)
-            j = j + 1
-            cond_2 = j < end_pos
+        # Positions of this bag's entries that are not the padding index, computed
+        # with a mask instead of a per-index loop.
+        bag_positions = op.Range(start_pos, end_pos, 1)
+        bag_indices = op.Gather(indices, bag_positions)
+        normalized_indices = op.Where(
+            bag_indices < 0, bag_indices + num_embeddings_scalar, bag_indices
+        )
+        keep = op.Not(op.Equal(normalized_indices, padding_idx))
+        curr_offsets = op.Compress(bag_positions, keep, axis=0)
 
         # Empty input get zero value output, not empty output
         if op.Size(curr_offsets) == 0:
